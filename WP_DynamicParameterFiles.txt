@@ -1,0 +1,313 @@
+# DYNAMIC PARAMETER FILES
+** Whitepaper by SAJJAN JANARDHANAN **
+
+
+OVERVIEW
+
+The solution discussed in this white-paper was developed and implemented as part of an ETL Architecture in a Data Warehouse environment 
+that used Informatica PowerCenter as the ETL tool that was installed in a server running RHEL with Oracle as the database to house the 
+parameter file entries. The requirement was to generate parameter files at the time of ETL job execution with parameter values derived 
+from the prior ETL run. A classic example would be a delta or incremental load, where the date/time of the last ETL job execution keeps 
+changing and therefore a dynamic parameter file can be useful. Although there can be different ways to implement a solution for the delta 
+load (like a control table or mapping variable for instance), we will focus on dynamic parameter files in this white-paper for reasons 
+that they are scalable and more flexible.
+
+
+HIGH LEVEL DESIGN
+
+The solution discussed here will work with any UNIX-based operating system like Sun Solaris, AIX or RedHat; however some changes may be 
+required if the database of choice was different from Oracle. The diagram on the right illustrates the high-level design of this solution. 
+The parameter entries are manually entered into the table the first time. The updates to the parameter values can be made directly in the 
+ETL or via a stored procedure or a shell script. The creation of the parameter file is initiated using a shell script, which spools the 
+output of a SQL within the shell script into a flat file. The password to the user that connects to the database to fetch the parameter 
+entries is stored in a file that is accessible only to the OS user that runs the Informatica services for security purposes. 
+
+
+TABLE DESIGN
+
+The logical structure of parameter table is discussed here. For traceability purposes, an additional audit table would be helpful. The 
+audit table will be populated using triggers defined on the main parameter table. The entries in the parameter audit table will remain 
+untouched for traceability purposes. The project teams would be given limited permissions on this audit table. The code for the relevant 
+database objects are discussed in later sections. 
+
+  Table = Process Parameter
+          --> Process Name
+          --> Folder Name
+          --> Workflow Name
+          --> Parameter Sequence # (resets for every process)
+          --> Parameter Name
+          --> Parameter Value
+          --> Insert Date
+          --> Update Date
+          --> Insert User
+          --> Update User
+          
+  Table = Process Parameter Audit
+          --> <first 5 columns from the table above>
+          --> Parameter Value Old
+          --> Parameter Value New
+          --> DML Operation (Insert/Update/Delete)
+          --> Audit Date
+          --> Audit User
+          
+
+STORED PROCEDURE
+
+  Procedure = Update Process Parameter
+    Input Parameters = Process Name, Folder Name, Workflow Name, Parameter Name, Parameter Value
+    Action = Updates the parameter value for the given input parameters
+
+  Trigger = Process Parameter
+    Before Insert = 
+     Set the date column values to the current date
+     Insert a record into the audit table with DML-Operation set to “I” and current date & user set in 
+      fields Audit Date & Audit User respectively
+    Before Update
+     Set the update audit date column value to the current date
+     Insert a record into the audit table with DML-Operation set to “U” and current date & user set in 
+      fields Audit Date & Audit User respectively
+    Before Delete
+     Insert a record into the audit table with the DML-operation set to “D” and current date & user set 
+      in fields Audit Date & Audit User respectively
+
+  Trigger = Process Parameter Audit
+    Before Insert
+     Set the date column value to the current date
+     Set the user column value to the current date 
+    
+    
+SERVER FILES
+
+  Password File
+  • It is recommended that this be a pipe-delimited file
+  • It should be located in the home directory of the INFA service user
+  • This file will contain the DB passwords in clear text format
+  • This would not be accessible to other users in the server, because it will be located in the service user’s home directory; 
+    therefore it is imperative that the permissions to the home directory is set to 700
+  • A suggested field layout for file is given below; please note that the combination of the TNS Key Name & the User Name 
+    should be unique in the file - Database functional name, TNS key name, DB detail ( {SID/ServiceName}@HostName:Port ),
+    User name & Password 
+  • Example record in the file = EDW|EDWPROD|PHPEDW01@DWPROD:1521|INFA_DW|ABcd123
+  
+  Parameter File Creation Script
+  • Input parameters – Process Name, Parameter file absolute path
+  • Fetch password for the user in the database, where the Process Parameter table is located
+  • Connect to the database and query the Process Param table to spool the results into the file that is passed as a parameter
+  • Check for the spool or oracle errors and report
+
+  Parameter Update Script
+  • Input parameters – Process Name, Workflow Name, Parameter Name, Parameter Value
+  • Fetch password for the user in the database, where the Process Parameter table is located
+  • Connect to the database and call the stored procedure that updates the Process Parameter table 
+  
+
+SOURCE CODE
+
+  Table = T_PROCESS_PARAMETER
+          CREATE table T_PROCESS_PARAMETER (
+             PROCESS_NAME VARCHAR2(20 BYTE) NOT NULL ENABLE,
+             FOLDER_NAME VARCHAR2(20 BYTE) NOT NULL ENABLE,
+             WORKFLOW_NAME VARCHAR2(50 BYTE) NOT NULL ENABLE,
+             PARAMETER_SEQ INTEGER NOT NULL ENABLE,
+             PARAMETER_NAME VARCHAR2(200 BYTE) NOT NULL ENABLE,
+             PARAMETER_VALUE VARCHAR2(200 BYTE) NOT NULL ENABLE,
+             ETL_INSERT_DATE DATE NOT NULL ENABLE,
+             ETL_UPDATE_DATE DATE NOT NULL ENABLE,
+             CREATED_USER VARCHAR2(20 BYTE) NOT NULL ENABLE,
+             MODIFIED_USER VARCHAR2(20 BYTE) NOT NULL ENABLE ) ;
+          ALTER TABLE T_PROCESS_PARAMETER ADD CONSTRAINT PK_T_PROCESS_PARAMETER 
+            PRIMARY KEY (PROCESS_NAME, PARAMETER_SEQ) ;
+  
+  Table = T_PROCESS_PARAMETER_AUD
+          CREATE table T_PROCESS_PARAMETER_AUD (
+             PROCESS_NAME VARCHAR2(20 BYTE) NOT NULL ENABLE,
+             FOLDER_NAME VARCHAR2(20 BYTE) NOT NULL ENABLE,
+             WORKFLOW_NAME VARCHAR2(50 BYTE) NOT NULL ENABLE,
+             PARAMETER_SEQ INTEGER NOT NULL ENABLE,
+             PARAMETER_NAME VARCHAR2(200 BYTE) NOT NULL ENABLE,
+             OLD_PARAM_VALUE VARCHAR2(200 BYTE) NOT NULL ENABLE,
+             NEW_PARAM_VALUE VARCHAR2(200 BYTE) NOT NULL ENABLE,
+             DML_OPERATION VARCHAR2(1) NOT NULL ENABLE,
+             AUDIT_DATE DATE NOT NULL ENABLE,
+             AUDIT_USER VARCHAR2(20 BYTE) NOT NULL ENABLE ) ; 
+             
+  Stored Procedure = SP_UPDATE_PROCESS_PARAMETER
+          CREATE OR REPLACE PROCEDURE SP_UPDATE_PROCESS_PARAMETER (
+             P_PROCESS_NAME IN VARCHAR2,
+             P_FOLDER_NAME IN VARCHAR2,
+             P_WORKFLOW_NAME IN VARCHAR2,
+             P_PARAMETER_NAME IN VARCHAR2,
+             P_PARAMETER_VALUE IN VARCHAR2) AS V_IROWS_FOUND PLS_INTEGER;
+            BEGIN
+               -- checking if parameter exists
+               SELECT COUNT(*) INTO V_IROWS_FOUND
+               FROM T_PROCESS_PARAMETER
+               WHERE 1=1
+               AND PROCESS_NAME = P_PROCESS_NAME
+               AND FOLDER_NAME = P_FOLDER_NAME
+               AND WORKFLOW_NAME = P_WORKFLOW_NAME
+               AND PARAMETER_NAME = P_PARAMETER_NAME;
+               -- raise error if parameter not found
+               IF V_IROWS_FOUND = 0 THEN
+                 RAISE_APPLICATION_ERROR(-20101, 'PARAMETER NOT FOUND.');
+               ELSE
+                 UPDATE T_PROCESS_PARAMETER
+                 SET PARAMETER_VALUE = P_PARAMETER_VALUE
+                 WHERE 1=1
+                 AND PROCESS_NAME = P_PROCESS_NAME
+                 AND FOLDER_NAME = P_FOLDER_NAME
+                 AND WORKFLOW_NAME = P_WORKFLOW_NAME
+                 AND PARAMETER_NAME = P_PARAMETER_NAME ;
+                 COMMIT;
+               END IF;
+             END; 
+
+  Example = CALL SP_UPDATE_PROCESS_PARAMETER('KPI','Statistics','wf_stats','$LastEtlRun','04/30/2018'); 
+
+Trigger = TRG_PROCESS_PARAMETER_BI
+          CREATE OR REPLACE TRIGGER TRG_PROCESS_PARAMETER_BI
+            BEFORE INSERT ON T_PROCESS_PARAMETER FOR EACH ROW
+            BEGIN
+               :NEW.ETL_INSERT_DATE := SYSDATE ;
+               :NEW.ETL_UPDATE_DATE := SYSDATE ;
+               :NEW.CREATED_USER := USER ;
+               :NEW.MODIFIED_USER := USER ;
+               INSERT INTO T_PROCESS_PARAMETER_AUD
+                  (PROCESS_NAME, FOLDER_NAME, WORKFLOW_NAME, PARAMETER_SEQ, PARAMETER_NAME, OLD_PARAM_VALUE, NEW_PARAM_VALUE, DML_OPERATION)
+               VALUES
+                  (:NEW.PROCESS_NAME, :NEW.FOLDER_NAME, :NEW.WORKFLOW_NAME, :NEW.PARAMETER_SEQ, :NEW.PARAMETER_NAME, 'N/A', :NEW.PARAMETER_VALUE, 'I');
+            END ;
+          ALTER TRIGGER TRG_PROCESS_PARAMETER_BI ENABLE ;
+
+Trigger = TRG_PROCESS_PARAMETER_BU
+          CREATE OR REPLACE TRIGGER TRG_PROCESS_PARAMETER_BU
+            BEFORE UPDATE ON T_PROCESS_PARAMETER FOR EACH ROW
+              BEGIN
+                 :NEW.ETL_UPDATE_DATE := SYSDATE ;
+                 :NEW.MODIFIED_USER := USER ;
+                 INSERT INTO T_PROCESS_PARAMETER_AUD
+                    (PROCESS_NAME, FOLDER_NAME, WORKFLOW_NAME, PARAMETER_SEQ, PARAMETER_NAME, OLD_PARAM_VALUE, NEW_PARAM_VALUE, DML_OPERATION)
+                 VALUES
+                    (:OLD.PROCESS_NAME, :OLD.FOLDER_NAME, :OLD.WORKFLOW_NAME, :OLD.PARAMETER_SEQ, :OLD.PARAMETER_NAME,
+                      :OLD.PARAMETER_VALUE, :NEW.PARAMETER_VALUE, 'U');
+              END ;
+          ALTER TRIGGER TRG_PROCESS_PARAMETER_BU ENABLE ; 
+
+Trigger = TRG_PROCESS_PARAMETER_BD
+          CREATE OR REPLACE TRIGGER TRG_PROCESS_PARAMETER_BD
+            BEFORE DELETE ON T_PROCESS_PARAMETER FOR EACH ROW
+              BEGIN
+                 INSERT INTO T_PROCESS_PARAMETER_AUD
+                    (PROCESS_NAME, FOLDER_NAME, WORKFLOW_NAME, PARAMETER_SEQ, PARAMETER_NAME, OLD_PARAM_VALUE, NEW_PARAM_VALUE, DML_OPERATION)
+                 VALUES
+                    (:OLD.PROCESS_NAME, :OLD.FOLDER_NAME, :OLD.WORKFLOW_NAME, :OLD.PARAMETER_SEQ, :OLD.PARAMETER_NAME, :OLD.PARAMETER_VALUE, 'N/A', 'D');
+              END ;
+          ALTER TRIGGER TRG_PROCESS_PARAMETER_BD ENABLE ;
+
+Trigger = TRG_PROCESS_PARAMETER_AUD_BI
+          CREATE OR REPLACE TRIGGER TRG_PROCESS_PARAMETER_AUD_BI
+            BEFORE INSERT ON T_PROCESS_PARAMETER_AUD FOR EACH ROW
+              BEGIN
+                :NEW.AUDIT_DATE := SYSDATE ;
+                :NEW.AUDIT_USER := USER ;
+              END ;
+          ALTER TRIGGER TRG_PROCESS_PARAMETER_AUD_BI ENABLE ;
+
+Script = ds_create_param_file.sh
+          #!/bin/bash
+          # Script Name : ds_create_param_file.sh
+          # Author : Sajjan Janardhanan
+          # Description : Create Dynamic Parameter Files
+          # Parameters : Process Name & absolute path of the parameter file
+          . ~/.bash_profile
+          echo `date +%Y%m%d_%H%M%S`"|"`who -m|cut -d"(" -f2|sed "s/)//"`"|"$$"|BEGIN|"$0"|"$1"|"$2>>$MASTER_LOG
+          now=`date +%Y-%m-%d_%T`
+          file_log=”/infa_shared/Scripts/logs/ds_create_param_file_”$now”.log”
+          {
+            echo “INF: Script name = “$0
+            echo “INF: Run time = “$now
+            if [ $# -ne 2 ]; then
+               echo “ERR: Insufficient or Too many arguments”
+               exit 1
+            else
+               i_process=$1
+               i_file_param=$2
+            fi
+            echo “INF: Parameter (process) = “$i_process
+            echo “INF: Parameter (parameter file) = “$i_file_param
+            db_passwd=`grep –iw ${DB_TNSKEY} ${FILE_PASSWD}|grep –iw ${USER_PASSWD}|cut –d”|” –f5`
+            return_value=`sqlplus –s ${USER_PASSWD}/${db_passwd}@${DB_TNSKEY} <<SQL+
+              whenever sqlerror exit -1
+              set linesize 1300 trimspool on heading off echo off term off pagesize 0
+              set feedback off timing off verify off
+              set serveroutput on size 1000000
+              spool ${i_file_param};
+              select param_nm || param_val as param_ln from (
+              select parameter_name as param_nm,
+              case parameter_value when ‘N/A’ then null else ‘=’|| parameter_value end as param_val
+              from t_process_parameter where 1=1
+              and process_name=’${i_process}’
+              order by parameter_seq) ;
+              spool off;
+              exit;
+              SQL`
+            spool_err=$?
+            sp_err=`echo $return_value|grep -l "SP2-"|wc -c`
+            ora_err=`echo $return_value|grep -l "ORA-"|wc -c`
+            if [ $sp_err -gt 0 ] || [ $ora_err -gt 0 ] || [ $spool_err -ne 0 ]; then 
+              echo "ERR: Spooling completed in failure – “${return_value}
+              exit 2
+            else
+              echo "INF: The parameter file has been created successfully"
+            fi
+          } > $file_log 2>&1 echo `date +%Y%m%d_%H%M%S`"|"`who -m|cut -d"(" -f2|sed "s/)//"`"|"$$"|END|"$0"|"$1"|"$2>>$MASTER_LOG
+
+        Example
+        • ./ds_create_param_file.sh MIDAS_V2 $PMRootDir/BWParam/dyn_MIDAS.txt
+        • ./ds_create_param_file.sh KPI $PMRootDir/BWParam/Miscellaneous/dyn_wf_stats.txt
+        
+Script = ds_update_param.sh
+        #!/bin/bash
+        # Script Name : ds_update_param.sh
+        # Author : Sajjan Janardhanan
+        # Description : Update a parameter value in T_PROCESS_PARAMETER
+        # Parameters : Name of Process, Workflow, Parameter & Parameter value
+        . ~/.bash_profile
+        echo `date +%Y%m%d_%H%M%S`"|"`who -m|cut -d"(" -f2|sed "s/)//"`"|"$$"|BEGIN|"$0"|"$1"|"$2"|"$3"|"$4"|"$5>>$MASTER_LOG
+        now=`date +%Y-%m-%d_%T`
+        file_log="/infa_shared/Scripts/logs/ds_update_param_"$now".log"
+        {
+          echo "INF: Script name = "$0
+          echo "INF: Run time = "$now
+          if [ $# -ne 5 ]; then
+             echo "ERR: Insufficient or Too many arguments"
+             exit 1
+          else
+             i_process=$1 ; i_folder=$2 ; i_workflow=$3 ; i_paramnm=$4 ; i_paramval=$5
+             echo "INF: Script call details = "$0"|"$1"|"$2"|"$3"|"$4"|"$5
+          fi
+          db_passwd=`grep -iw ${DB_TNSKEY} ${FILE_PASSWD}|grep -iw ${USER_PASSWD}|cut -d"|" -f5`
+          sqlplus -s ${USER_PASSWD}/${db_passwd}@${DB_TNSKEY} <<END
+            whenever sqlerror exit 10
+            CALL SP_UPDATE_PROCESS_PARAMETER('${i_process}', '${i_folder}', '${i_workflow}', '${i_paramnm}', '${i_paramval}') ;
+            exit;
+            END
+          sqlplus_err=$?
+          if [ $spool_err -ne 0 ]; then
+             echo "ERR: Spooling completed in failure"
+             exit 2
+          else
+             echo "INF: Parameter updated successfully"
+          fi
+        } > $file_log 2>&1
+        echo `date +%Y%m%d_%H%M%S`"|"`who -m|cut -d"(" -f2|sed "s/)//"`"|"$$"|END|"$0"|"$1"|"$2"|"$3"|"$4"|"$5>>$MASTER_LOG
+
+        Example
+        • ./ds_update_param.sh KPI Statistics wf_stats '$LastEtlRun' '05/01/2018'
+        • ./ds_update_param.sh KPI Statistics wf_stats '$LastEtlRun' "`date +%m/%d/%Y`"
+
+
+BASH_PROFILE additional variables
+  • DB_TNSKEY – Example = INFDDB01
+  • FILE_PASSWD – Example = database_pass.lst
+  • USER_PASSWD – Example = INFASVC 
